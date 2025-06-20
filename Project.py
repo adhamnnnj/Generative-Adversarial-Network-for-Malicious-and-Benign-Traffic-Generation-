@@ -1,120 +1,202 @@
-import warnings
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import LabelEncoder
-from scipy.stats import zscore
-import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.utils.data import Dataset, DataLoader
 
+# Reproducibility & device setup
+torch.manual_seed(42)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
-dataset = pd.read_csv("Y:/Uni/Sem6/Modelling and Simulation/Dataset.csv")
-sample_da = []
+# 2. Preprocessing (with one-hot for categorical + printed split IPs)
+def preprocess_df(df, sample_size=100_000):
+    # 1) Sample
+    if len(df) > sample_size:
+        df = df.sample(sample_size, random_state=42).reset_index(drop=True)
+    print("After sampling:", df.shape)
 
-# Index counter
-i = 0
+    # 2) Split IPs using provided method
+    def split_ip(series, prefix):
+        ip_split = series.str.split('.', expand=True)
+        ip_split.columns = [f"{prefix}_{i+1}" for i in range(4)]
+        ip_split = ip_split.astype(int)
+        return ip_split
 
-# Append rows to the array until we reach 100,000 or the dataset ends
-while i < 100000 and i < len(dataset):
-    row = dataset.iloc[i].to_dict()  # Convert row to dictionary (optional)
-    sample_da.append(row)
-    i += 1
+    orig_h = split_ip(df['id.orig_h'], 'orig_h')
+    resp_h = split_ip(df['id.resp_h'], 'resp_h')
 
-sample_ds = pd.DataFrame(sample_da)
-sample_ds.head()
-#print(sample_ds)
-# Split the 'id.orig_h' IP column into four octets
-ip_split = sample_ds['id.orig_h'].str.split('.', expand=True)
-ip_split.columns = ['IP 1', 'IP 2', 'IP 3', 'IP 4']
-ip_split = ip_split.astype(int)
-# Concatenate the new columns to the original DataFrame
-df_with_ip_parts = pd.concat([sample_ds, ip_split], axis=1)
-# Preview the result
-#print(df_with_ip_parts[['id.orig_h', 'IP 1', 'IP 2', 'IP 3', 'IP 4']].head())
-# Make a copy of the dataset to apply label encoding
-label_encoded_df = sample_ds.copy()
-for col in sample_ds.columns:
-    null_count = sample_ds[col].isnull().sum()
-    if null_count > 0:
-        print("Column", col, " has ", null_count, " null values")
-    inf_count = (sample_ds[col] == float('inf')).sum()
-    if inf_count > 0:
-        print("Column", col, " has ", inf_count, " infinite values")
+    # Print the split IPs
+    print("\nSplit id.orig_h:")
+    print(orig_h.head())
 
-for col in sample_ds.columns:
-    if sample_ds[col].dtype == 'object':
-        print("Column", col, " has ", dataset[col].nunique(), " categories")
-    else:
-        print("Column", col, " is not categorical")
-label_enc = LabelEncoder()
-categorical_cols = ['proto']  # Add 'service', 'flag' if they exist in your dataset
-for col in categorical_cols:
-    sample_ds[col] = label_enc.fit_transform(sample_ds[col])
+    print("\nSplit id.resp_h:")
+    print(resp_h.head())
 
-sample_ds = pd.get_dummies(sample_ds, columns=['proto'], prefix='proto')
-#print(sample_ds)
+    # 3) Label encoder for labels
+    label_le = LabelEncoder().fit(df['label'])
 
-# Example: Automatically detect numerical columns (excluding IPs and categories)
-numerical_cols = sample_ds.select_dtypes(include=['float64', 'int64']).columns.tolist()
-scaler = StandardScaler()
-standardized_data = scaler.fit_transform(sample_ds[numerical_cols])
-#print(standardized_data)
-#----------------------------------------------------------------------------------------------------------------------------
-label_column = sample_ds['label']
-print(label_column)
-real_traffic = []
-fake_traffic = []
-for i, label in enumerate(label_column):
-    if isinstance(label, str) and label.lower() == "benign":
-        real_traffic.append(i)
-        print(f"Row {i} is real traffic\n")
-    elif isinstance(label, str) and label.lower() == "malicious":
-        fake_traffic.append(i)
-        print(f"Row {i} is fake traffic\n")
+    # 4) One-hot encode proto, conn_state, history
+    cat_cols = ['proto', 'conn_state', 'history']
+    encoders = {}
+    ohe_dfs = []
+    for c in cat_cols:
+        le = LabelEncoder().fit(df[c])
+        encoders[c] = le
+        idx = le.transform(df[c])
+        ohe = pd.get_dummies(idx, prefix=c).astype(float)
+        ohe_dfs.append(ohe)
 
-real_data = sample_ds.iloc[real_traffic]  # Only rows marked as 'Benign'
-real_numerical_data = standardized_data[real_traffic, :]  # NumPy array of real traffic only
-mean_vector = np.mean(real_numerical_data, axis=0)
-cov_matrix = np.cov(real_numerical_data, rowvar=False)
-# Generate synthetic samples from the same distribution
-synthetic_samples = np.random.multivariate_normal(mean_vector, cov_matrix, size=1000)
-synthetic_df = pd.DataFrame(synthetic_samples, columns=numerical_cols)
-print(synthetic_df.head())
-# Example: Compare distribution of 1 feature
-sns.kdeplot(real_numerical_data[:, 0], label="Real", fill=True)
-sns.kdeplot(synthetic_samples[:, 0], label="Fake", fill=True)
-plt.legend()
-plt.title("Feature Distribution: Real vs Fake")
-plt.show()
-#--------------------------------------------------------------------------------------------------------------------
-target_size = 100000
+    # 5) Normalize numeric features
+    num_cols = ['id.orig_p', 'id.resp_p', 'missed_bytes',
+                'orig_pkts', 'orig_ip_bytes', 'resp_pkts', 'resp_ip_bytes']
+    scaler = StandardScaler().fit(df[num_cols])
+    scaled = pd.DataFrame(scaler.transform(df[num_cols]), columns=num_cols, dtype=float)
 
-# Generate synthetic samples (100000 rows) from multivariate normal
-synthetic_samples_full = np.random.multivariate_normal(mean_vector, cov_matrix, size=target_size)
+    # 6) Combine all features
+    features = pd.concat([orig_h, resp_h] + ohe_dfs + [scaled], axis=1)
+    features = features.astype(float)
+    X = torch.tensor(features.values, dtype=torch.float32)
+    print("Feature tensor shape:", X.shape)
 
-# Inverse transform to get original scale
-original_scale_synthetic_full = scaler.inverse_transform(synthetic_samples_full)
+    return X, scaler, encoders, num_cols, label_le, ohe_dfs
 
-# Create a DataFrame from the generated numerical data
-synthetic_df_full = pd.DataFrame(original_scale_synthetic_full, columns=numerical_cols)
+# Decode synthetic data back into readable format
+def decode_synthetic(syn_np, scaler, encoders, num_cols, label_le, ohe_dfs):
+    orig_h = np.floor(np.clip(syn_np[:, 0:4], 0, 255)).astype(int)
+    resp_h = np.floor(np.clip(syn_np[:, 4:8], 0, 255)).astype(int)
 
-# Generate random IP address components and reconstruct IPs
-ip_parts_full = np.random.randint(1, 255, size=(target_size, 4))
-synthetic_df_full['id.orig_h'] = ['{}.{}.{}.{}'.format(*row) for row in ip_parts_full]
+    offs = 8
+    decoded = {}
+    for c, ohe in zip(encoders.keys(), ohe_dfs):
+        length = ohe.shape[1]
+        block = syn_np[:, offs:offs + length]
+        idxs = np.argmax(block, axis=1)
+        decoded[c] = encoders[c].inverse_transform(idxs)
+        offs += length
 
-# Reconstruct protocol using random valid proto labels
-if 'proto' in categorical_cols:
-    proto_random = np.random.randint(0, len(label_enc.classes_), target_size)
-    synthetic_df_full['proto'] = label_enc.inverse_transform(proto_random)
+    num_block = np.clip(syn_np[:, offs:], 0, None)
+    num_real = scaler.inverse_transform(num_block)
 
-# Add labels (50% Benign, 50% Malicious)
-synthetic_df_full['label'] = ['Benign' if i < target_size / 2 else 'Malicious' for i in range(target_size)]
+    out = {
+        'id.orig_h': ['.'.join(map(str, r)) for r in orig_h],
+        'id.resp_h': ['.'.join(map(str, r)) for r in resp_h],
+    }
 
-# Organize columns for readability
-columns_order = ['id.orig_h', 'proto', 'label'] + [col for col in synthetic_df_full.columns if col not in ['id.orig_h', 'proto', 'label']]
-human_readable_df_full = synthetic_df_full[columns_order]
+    out.update(decoded)
+    for i, col in enumerate(num_cols):
+        out[col] = np.floor(num_real[:, i]).astype(int)
 
-# Show first few rows
-print(human_readable_df_full)
-#------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    return pd.DataFrame(out)
+
+# 3. Load and preprocess data
+df = pd.read_csv('C:/Users/dodo_/Downloads/CTU-IoT-Malware-Capture-1-1conn.log.labeled.csv')
+df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+df.columns = df.columns.str.strip()
+
+X, scaler, encoders, num_cols, label_le, ohe_dfs = preprocess_df(df)
+
+# 4. Dataset and DataLoader
+class NetDataset(Dataset):
+    def __init__(self, X):
+        self.X = X
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        return self.X[i]
+
+dl = DataLoader(NetDataset(X), batch_size=256, shuffle=True)
+
+# 5. GAN Models
+noise_dim = 100
+feature_dim = X.shape[1]
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(noise_dim, 256), nn.LeakyReLU(0.2),
+            nn.Linear(256, 512), nn.LeakyReLU(0.2),
+            nn.Linear(512, feature_dim)
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, 512), nn.LeakyReLU(0.2),
+            nn.Linear(512, 256), nn.LeakyReLU(0.2),
+            nn.Linear(256, 1), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+gen = Generator().to(device)
+disc = Discriminator().to(device)
+
+# 6. Training loop
+opt_g = torch.optim.Adam(gen.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_d = torch.optim.Adam(disc.parameters(), lr=2e-4, betas=(0.5, 0.999))
+crit = nn.BCELoss()
+best_g = 1e9
+
+for e in range(50):
+    gl, dloss = [], []
+    for real in dl:
+        real = real.to(device)
+        bs = real.size(0)
+        valid = torch.ones(bs, 1, device=device)
+        fake = torch.zeros(bs, 1, device=device)
+
+        # Discriminator step
+        opt_d.zero_grad()
+        pred_r = disc(real)
+        loss_r = crit(pred_r, valid)
+        z = torch.randn(bs, noise_dim, device=device)
+        pred_f = disc(gen(z).detach())
+        loss_f = crit(pred_f, fake)
+        (loss_r + loss_f).backward()
+        opt_d.step()
+
+        # Generator step
+        opt_g.zero_grad()
+        pred_g = disc(gen(torch.randn(bs, noise_dim, device=device)))
+        loss_g = crit(pred_g, valid)
+        loss_g.backward()
+        opt_g.step()
+
+        gl.append(loss_g.item())
+        dloss.append(((loss_r + loss_f) / 2).item())
+
+    ag, ad = np.mean(gl), np.mean(dloss)
+    print(f"Epoch {e+1:02d} | D {ad:.3f} | G {ag:.3f}")
+    if ag < best_g:
+        best_g = ag
+        torch.save(gen.state_dict(), 'generator.pt')
+
+print("Done – best G loss:", best_g)
+
+# 7. Generate synthetic traffic
+gen.load_state_dict(torch.load('generator.pt', map_location=device))
+gen.eval()
+need = 20
+with torch.no_grad():
+    z = torch.randn(need, noise_dim, device=device)
+    raw = gen(z).cpu().numpy()
+
+# 8. Decode synthetic data
+syn_df = decode_synthetic(raw, scaler, encoders, num_cols, label_le, ohe_dfs)
+syn_df['label'] = ['Benign']*10 + ['Malicious']*10
+
+# 9. Save and display
+syn_df.to_csv('synthetic_traffic.csv', index=False)
+print("Saved synthetic_traffic.csv:")
+print(syn_df.head(10))
 
